@@ -12,6 +12,8 @@
 #define RUN_UART_TEST      0
 #define RUN_PWM_TEST       0
 #define RUN_ADC_TEST       0
+#define RUN_I2C_TEST       0
+#define RUN_SPI_TEST       0
 
 void GPIO_Test(void);
 void TIMER_0_Test(void);
@@ -19,14 +21,14 @@ void EXT_INT_Test(void);
 void UART_Test(void);
 void PWM_Test(void);
 void ADC_Test(void);
+void I2C_Test(void);
+void SPI_Test(void);
 
-// Motor config
 #define MOTOR_PORT      GPIO_PORTC
 #define MOTOR_PIN1      GPIO_PIN0
 #define MOTOR_PIN2      GPIO_PIN2
 #define MOTOR_PWM_CH    PWM_CHANNEL_1
 
-// LED config
 #define LED_PORT        GPIO_PORTC
 #define LED_PIN         GPIO_PIN1
 
@@ -102,11 +104,22 @@ int main(void)
     #endif
 
     #if RUN_PWM_TEST == 1
-    PWM_Test(); // has internal loop
+    PWM_Test();
     #endif
 
     #if RUN_ADC_TEST == 1
     while(1) ADC_Test();
+    #endif
+
+    #if RUN_I2C_TEST == 1
+    I2C_Test(); // has internal loop
+    #endif
+
+    #if RUN_SPI_TEST == 1
+    while(1) {
+        SPI_Test();
+        for(u16 i = 0; i < 10000; i++);
+    }
     #endif
 
     return 0;

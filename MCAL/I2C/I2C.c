@@ -4,84 +4,74 @@
 #include "../../SERVICES/BIT_MATH.h"
 #include "../GPIO/GPIO_interface.h"
 
-/* SSPADD value for I2C clock */
-/* SSPADD = (FOSC / (4 * I2C_BAUDRATE)) - 1 */
-static u8 sspadd_value = (I2C_FOSC / (4UL * I2C_BAUDRATE)) - 1;
+/* SSPADD = (Fosc / (4 * BaudRate)) - 1
+ * Example: (4MHz / (4 * 100kHz)) - 1 = 9 */
+static u8 sspadd_value = (u8)((I2C_FOSC / (4UL * I2C_BAUDRATE)) - 1);
+
+/*
+ * I2C_Wait: blocks until the bus is idle.
+ * Checks that no transmit/receive operation is in progress:
+ *   - SSPSTAT bit 2 (RW) : transmission in progress
+ *   - SSPCON2 bits 4:0   : SEN/RSEN/PEN/RCEN/ACKEN all must be 0
+ * (Implementation matches lab slide 53)
+ */
+static void I2C_Wait(void)
+{
+    while ((SSPSTAT & 0x04) || (SSPCON2 & 0x1F));
+}
 
 void I2C_Init(void)
 {
-    /* Set RC3/SDA and RC4/SCL as inputs (open-drain) */
+    /* SCL = RC3, SDA = RC4 — must be inputs (open-drain) */
     GPIO_SetPinDirection(GPIO_PORTC, GPIO_PIN3, GPIO_INPUT);
     GPIO_SetPinDirection(GPIO_PORTC, GPIO_PIN4, GPIO_INPUT);
 
-    /* Initialize SSPADD for I2C clock frequency */
-    SSPADD = sspadd_value;
-
-    /* Configure SSPCON for I2C Master mode */
-    SSPCON = I2C_MASTER_MODE;
-
-    /* Enable I2C module */
-    SET_BIT(SSPCON, SSPEN);
-
-    /* Clear SSPSTAT flags */
-    SSPSTAT = 0;
+    SSPCON  = I2C_MASTER_MODE;  /* 0x28: SSPEN=1, I2C Master mode */
+    SSPCON2 = 0x00;
+    SSPSTAT = 0x00;
+    SSPADD  = sspadd_value;
 }
 
 void I2C_Start(void)
 {
-    /* Generate START condition */
-    SET_BIT(SSPCON, START);
-
-    /* Wait for START to complete */
-    while(GET_BIT(SSPCON, START));
-    while(GET_BIT(SSPSTAT, START) == 0);
+    I2C_Wait();
+    SET_BIT(SSPCON2, SEN);  /* Assert Start condition */
+    I2C_Wait();             /* Wait for hardware to clear SEN */
 }
 
 void I2C_Stop(void)
 {
-    /* Generate STOP condition */
-    SET_BIT(SSPCON, STOP);
-
-    /* Wait for STOP to complete */
-    while(GET_BIT(SSPCON, STOP));
+    I2C_Wait();
+    SET_BIT(SSPCON2, PEN);  /* Assert Stop condition */
+    I2C_Wait();             /* Wait for hardware to clear PEN */
 }
 
-void I2C_Write(u8 Data)
+u8 I2C_Write(u8 Data)
 {
-    /* Write data to SSPBUF */
-    SSPBUF = Data;
-
-    /* Wait for transmission complete */
-    while(GET_BIT(SSPSTAT, BF));
-
-    /* Wait for ACK/NACK from slave */
-    while(GET_BIT(SSPSTAT, STOP) == 0) {
-        if(GET_BIT(SSPCON, CKP)) break;
-    }
+    I2C_Wait();
+    SSPBUF = Data;          /* Triggers transmission */
+    I2C_Wait();             /* Wait for byte + ACK cycle to complete */
+    return GET_BIT(SSPCON2, ACKSTAT);  /* 0 = ACK (success), 1 = NACK (error) */
 }
 
 u8 I2C_Read(u8 Ack)
 {
     u8 data;
 
-    /* Enable receive mode */
-    SET_BIT(SSPCON, CKP);
+    I2C_Wait();
+    SET_BIT(SSPCON2, RCEN); /* Enable receive mode */
+    I2C_Wait();             /* Wait for full byte to be clocked in */
 
-    /* Wait for data reception */
-    while(!GET_BIT(SSPSTAT, BF));
+    data = SSPBUF;          /* Reading SSPBUF clears BF flag */
 
-    /* Read data from SSPBUF */
-    data = SSPBUF;
+    /* Prepare and send ACK or NACK */
+    if(Ack)
+        CLR_BIT(SSPCON2, ACKDT);    /* 0 = ACK  */
+    else
+        SET_BIT(SSPCON2, ACKDT);    /* 1 = NACK */
 
-    /* Send ACK or NACK */
-    if(Ack) {
-        CLR_BIT(SSPCON, UA);  /* Send ACK */
-    } else {
-        SET_BIT(SSPCON, UA);  /* Send NACK */
-    }
-
-    /* Wait for ACK/NACK transmission */
-    while(GET_BIT(SSPCON, ACKEN));
+    SET_BIT(SSPCON2, ACKEN);        /* Trigger acknowledge sequence */
+    I2C_Wait();
 
     return data;
 }
@@ -90,30 +80,22 @@ u8 I2C_WriteDevice(u8 Address, u8 *Data, u8 Length)
 {
     u8 i;
 
-    /* Generate START condition */
     I2C_Start();
 
-    /* Send slave address with WRITE bit (0) */
-    I2C_Write((Address << 1) | 0);
-
-    /* Check for ACK from slave */
-    if(GET_BIT(SSPSTAT, RW)) {
+    /* Send 7-bit address with Write bit (0) */
+    if(I2C_Write((u8)((Address << 1) | 0x00))) {
         I2C_Stop();
-        return I2C_ERROR;
+        return I2C_ERROR;   /* Slave did not acknowledge */
     }
 
-    /* Send data bytes */
     for(i = 0; i < Length; i++) {
-        I2C_Write(Data[i]);
-        if(GET_BIT(SSPSTAT, RW)) {
+        if(I2C_Write(Data[i])) {
             I2C_Stop();
             return I2C_ERROR;
         }
     }
 
-    /* Generate STOP condition */
     I2C_Stop();
-
     return I2C_SUCCESS;
 }
 
@@ -121,29 +103,19 @@ u8 I2C_ReadDevice(u8 Address, u8 *Data, u8 Length)
 {
     u8 i;
 
-    /* Generate START condition */
     I2C_Start();
 
-    /* Send slave address with READ bit (1) */
-    I2C_Write((Address << 1) | 1);
-
-    /* Check for ACK from slave */
-    if(GET_BIT(SSPSTAT, RW)) {
+    /* Send 7-bit address with Read bit (1) */
+    if(I2C_Write((u8)((Address << 1) | 0x01))) {
         I2C_Stop();
         return I2C_ERROR;
     }
 
-    /* Read data bytes */
     for(i = 0; i < Length; i++) {
-        if(i < Length - 1) {
-            Data[i] = I2C_Read(1);  /* Send ACK for all but last byte */
-        } else {
-            Data[i] = I2C_Read(0);  /* Send NACK for last byte */
-        }
+        /* Send ACK after every byte except the last one (NACK on last) */
+        Data[i] = I2C_Read(i < (Length - 1));
     }
 
-    /* Generate STOP condition */
     I2C_Stop();
-
     return I2C_SUCCESS;
 }
